@@ -145,7 +145,12 @@ namespace StreamTracker
                 if (File.Exists(SettingsPath))
                     s = new JavaScriptSerializer().Deserialize<Settings>(File.ReadAllText(SettingsPath, Encoding.UTF8));
             }
-            catch { }
+            catch (Exception ex)
+            {
+                // Испорченный файл не теряем: откладываем копию рядом (настройки придётся задать заново)
+                Log.Error("settings.json повреждён", ex);
+                try { File.Copy(SettingsPath, SettingsPath + ".broken-" + DateTime.Now.ToString("yyyyMMdd-HHmmss"), true); } catch { }
+            }
             var d = new Settings();
             if (s == null) return d;
             if (s.channel == null) s.channel = "";
@@ -159,7 +164,11 @@ namespace StreamTracker
         {
             reportDays = reportDays.Distinct().OrderBy(x => x).ToList();
             Directory.CreateDirectory(Paths.Data);
-            File.WriteAllText(SettingsPath, new JavaScriptSerializer().Serialize(this), new UTF8Encoding(false));
+            // Через временный файл: если выключат питание посреди записи, прежние настройки останутся целыми
+            string tmp = SettingsPath + ".tmp";
+            File.WriteAllText(tmp, new JavaScriptSerializer().Serialize(this), new UTF8Encoding(false));
+            if (File.Exists(SettingsPath)) File.Replace(tmp, SettingsPath, null);
+            else File.Move(tmp, SettingsPath);
         }
     }
     // ---------- Chrome через DevTools Protocol ----------
@@ -390,11 +399,86 @@ namespace StreamTracker
         {
             if (IsRunning())
             {
-                using (var wc = new WebClient()) wc.UploadString("http://127.0.0.1:" + Port + "/json/new?" + url, "PUT", "");
-                return;
+                if (IsHeadless())
+                {
+                    // Работает скрытый браузер (сверка, сбор отчёта, проверка входа) с тем же профилем.
+                    // Новый Chrome передал бы страницу входа ему, и она открылась бы невидимо — закрываем его
+                    // (дождавшись, пока он освободится) и запускаем видимый.
+                    if (!Lock.Wait(TimeSpan.FromSeconds(20)))
+                        throw new Exception("сейчас трекер собирает статистику Twitch — попробуйте через минуту");
+                    try
+                    {
+                        Task.Run(() => CloseBrowser()).Wait(5000);
+                        for (int i = 0; i < 25 && IsRunning(); i++) Thread.Sleep(200);
+                    }
+                    finally { Lock.Release(); }
+                    if (IsRunning()) throw new Exception("не получилось закрыть фоновый браузер трекера — попробуйте ещё раз");
+                }
+                else
+                {
+                    // Видимый браузер уже открыт: страница входа есть — показываем её, а не плодим вкладки
+                    try
+                    {
+                        var pages = json.DeserializeObject(Get("/json/list")) as object[];
+                        var open = pages == null ? null : pages.OfType<Dictionary<string, object>>().FirstOrDefault(p =>
+                            Convert.ToString(p["type"]) == "page" && Convert.ToString(p["url"]).Contains("twitch.tv/login"));
+                        if (open != null)
+                        {
+                            Get("/json/activate/" + Convert.ToString(open["id"]));
+                            return;
+                        }
+                    }
+                    catch { }
+                    // Иначе — новое окно, а не вкладка: если все окна закрыли, а Chrome остался работать в фоне,
+                    // вкладка открылась бы без окна и была бы не видна
+                    try
+                    {
+                        Task.Run(async () =>
+                        {
+                            var v = json.DeserializeObject(Get("/json/version")) as Dictionary<string, object>;
+                            using (var browser = await Cdp.Connect(Convert.ToString(v["webSocketDebuggerUrl"])))
+                                await browser.Send("Target.createTarget", new Dictionary<string, object>
+                                {
+                                    { "url", url }, { "newWindow", true }, { "background", false }
+                                });
+                        }).Wait(10000);
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error("новое окно входа", ex);
+                        throw new Exception("не получилось открыть окно в уже запущенном браузере трекера — закройте его и попробуйте ещё раз");
+                    }
+                }
             }
             Directory.CreateDirectory(ProfileDir);
             loginWindow = Process.Start(Exe(), Args() + " \"" + url + "\"");
+            // Ждём, пока браузер поднимется: иначе ожидание входа на медленном компьютере решило бы, что окно уже закрыли
+            for (int i = 0; i < 75 && !IsRunning(); i++) Thread.Sleep(200);
+        }
+
+        // Открыта ли ещё страница входа Twitch. Смотрим только список вкладок (простой HTTP-запрос),
+        // не подключаясь к браузеру: подключение во время входа Twitch может принять за бота.
+        public static bool LoginPageOpen()
+        {
+            try
+            {
+                var pages = json.DeserializeObject(Get("/json/list")) as object[];
+                return pages != null && pages.OfType<Dictionary<string, object>>().Any(p =>
+                    Convert.ToString(p["type"]) == "page" &&
+                    (Convert.ToString(p["url"]).Contains("twitch.tv/login") || Convert.ToString(p["url"]).Contains("passport.twitch.tv")));
+            }
+            catch { return false; }
+        }
+
+        static bool IsHeadless()
+        {
+            try
+            {
+                var v = json.DeserializeObject(Get("/json/version")) as Dictionary<string, object>;
+                return v != null && Convert.ToString(v["User-Agent"]).IndexOf("Headless", StringComparison.OrdinalIgnoreCase) >= 0;
+            }
+            catch { return false; }
         }
 
         // Закрыть окно входа, открытое трекером, — после того как вход выполнен
@@ -490,9 +574,12 @@ namespace StreamTracker
         }
 
         // Под каким ником выполнен вход в Twitch в профиле трекера (null — не выполнен)
-        public static async Task<string> TwitchLogin()
+        // launchIfNeeded = false — только спросить уже открытый браузер (для ожидания входа в открытом окне),
+        // чтобы проверка каждые 3 секунды не запускала скрытый браузер, когда окно входа закрыли
+        public static async Task<string> TwitchLogin(bool launchIfNeeded = true)
         {
             if (!Directory.Exists(ProfileDir)) return null;
+            if (!launchIfNeeded && !IsRunning()) return null;
             await Lock.WaitAsync();
             try { return await TwitchLoginLocked(); }
             finally { Lock.Release(); }

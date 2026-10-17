@@ -425,6 +425,7 @@ namespace StreamTracker
         async void Collect()
         {
             if (working) return;
+            bool needLogin = false;
             working = true;
             failed = false;
             items = null;
@@ -470,11 +471,7 @@ namespace StreamTracker
             {
                 failed = true;
                 status = "Нужно войти в Twitch";
-                Invalidate();
-                if (DarkDialog.Ask(IsDisposed ? null : this, "Нужно войти в Twitch",
-                        "Трекер откроет окно браузера со своим отдельным профилем. Войдите в аккаунт " + Config.Channel +
-                        ", закройте окно браузера и нажмите «Собрать» ещё раз.", "Войти в Twitch", "Отмена", Theme.Accent))
-                    Chrome.OpenVisible("https://www.twitch.tv/login");
+                needLogin = true;
             }
             catch (Exception ex)
             {
@@ -485,6 +482,21 @@ namespace StreamTracker
             {
                 working = false;
                 Invalidate();
+            }
+
+            // Окно входа — уже вне try/catch (в C# 5 нельзя ждать внутри catch)
+            if (needLogin && DarkDialog.Ask(IsDisposed ? null : this, "Нужно войти в Twitch",
+                    "Трекер откроет окно браузера со своим отдельным профилем. Войдите в аккаунт " + Config.Channel +
+                    ", закройте окно браузера и нажмите «Собрать» ещё раз.", "Войти в Twitch", "Отмена", Theme.Accent))
+            {
+                string error = null;
+                try { await Task.Run(() => Chrome.OpenVisible("https://www.twitch.tv/login")); }
+                catch (Exception ex) { error = ex.Message; }
+                if (error != null)
+                {
+                    status = "Не получилось открыть окно входа: " + error;
+                    Invalidate();
+                }
             }
         }
     }

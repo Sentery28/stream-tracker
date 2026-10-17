@@ -103,8 +103,21 @@ namespace StreamTracker
 
             loginPoll.Tick += delegate
             {
-                if (DateTime.Now > pollUntil) loginPoll.Stop();
-                else if (!loginBusy && loginName == null) CheckLogin(true);
+                if (DateTime.Now > pollUntil) { loginPoll.Stop(); return; }
+                if (loginBusy || loginName != null) return;
+                if (!Chrome.IsRunning())
+                {
+                    // Окно входа закрыли, не войдя, — перестаём ждать (и не запускаем скрытый браузер каждые 3 секунды)
+                    loginPoll.Stop();
+                    loginStatus = "Окно входа закрыто — нажмите «Войти в Twitch», чтобы открыть его снова";
+                    loginFailed = false;
+                    Invalidate();
+                    return;
+                }
+                // Пока страница входа открыта — человек ещё входит: не подключаемся к браузеру вообще.
+                // Проверяем вход один раз, когда Twitch ушёл со страницы входа.
+                if (Chrome.LoginPageOpen()) return;
+                CheckLogin(true, false);
             };
             Shown += delegate { CheckLogin(true); };
         }
@@ -233,11 +246,14 @@ namespace StreamTracker
             days[i] = v;
         }
 
-        void OpenLogin()
+        async void OpenLogin()
         {
+            loginFailed = false;
+            loginStatus = "Открываю окно входа…";
+            Invalidate();
             try
             {
-                Chrome.OpenVisible("https://www.twitch.tv/login");
+                await Task.Run(() => Chrome.OpenVisible("https://www.twitch.tv/login"));
                 loginFailed = false;
                 loginStatus = "Войдите в открывшемся окне браузера — трекер заметит вход сам";
                 pollUntil = DateTime.Now.AddMinutes(10);
@@ -277,7 +293,8 @@ namespace StreamTracker
             if (loginName == null) OpenLogin();
         }
 
-        async void CheckLogin(bool quiet)
+        // launch = false — только спросить уже открытое окно входа, не запуская браузер
+        async void CheckLogin(bool quiet, bool launch = true)
         {
             if (loginBusy) return;
             loginBusy = true;
@@ -285,7 +302,7 @@ namespace StreamTracker
             Invalidate();
             try
             {
-                string name = await Task.Run(() => Chrome.TwitchLogin());   // запуск браузера — не в потоке окна
+                string name = await Task.Run(() => Chrome.TwitchLogin(launch));   // запуск браузера — не в потоке окна
                 loginName = name;
                 if (name != null)
                 {
@@ -299,11 +316,9 @@ namespace StreamTracker
             }
             catch (Exception ex)
             {
-                if (!quiet)
-                {
-                    loginFailed = true;
-                    loginStatus = "Не получилось проверить вход: " + ex.Message;
-                }
+                // Показываем всегда: иначе при первом запуске человек видел бы «Вход не выполнен» без причины
+                loginFailed = true;
+                loginStatus = "Не получилось проверить вход: " + ex.Message;
             }
             finally
             {
