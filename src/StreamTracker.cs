@@ -13,6 +13,7 @@ using System.Linq;
 using System.Net;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Web.Script.Serialization;
@@ -21,7 +22,7 @@ using Microsoft.Win32;
 
 [assembly: System.Reflection.AssemblyTitle("Трекер стримов")]
 [assembly: System.Reflection.AssemblyProduct("Трекер стримов")]
-[assembly: System.Reflection.AssemblyVersion("1.0.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.2.0.0")]
 
 namespace StreamTracker
 {
@@ -29,6 +30,7 @@ namespace StreamTracker
     {
         // Значения из настроек (settings.json), задаются при первом запуске
         public static string Channel = "";
+        public static bool ByLink;               // канал указан ссылкой — без входа, статистика Twitch недоступна
         public static int Goal = 20;
         public static int[] ReportDays = { 13, 29 };
 
@@ -38,6 +40,7 @@ namespace StreamTracker
         public static void Apply(Settings s)
         {
             Channel = s.channel;
+            ByLink = s.byLink;
             Goal = s.goal;
             ReportDays = s.reportDays.Distinct().OrderBy(x => x).ToArray();
         }
@@ -203,24 +206,7 @@ namespace StreamTracker
         // Тот же публичный запрос, что делает сам сайт Twitch. null — канал офлайн.
         public static LiveInfo GetLive()
         {
-            var req = (HttpWebRequest)WebRequest.Create("https://gql.twitch.tv/gql");
-            req.Method = "POST";
-            req.ContentType = "application/json";
-            req.Timeout = 20000;
-            req.ReadWriteTimeout = 20000;
-            req.Headers.Add("Client-Id", "kimne78kx3ncx6brgo4mv6wki5h1ko");
-            byte[] body = Encoding.UTF8.GetBytes(
-                "{\"query\":\"query{user(login:\\\"" + Config.Channel + "\\\"){stream{id createdAt}}}\"}");
-            using (var s = req.GetRequestStream()) s.Write(body, 0, body.Length);
-
-            string text;
-            using (var resp = req.GetResponse())
-            using (var r = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
-                text = r.ReadToEnd();
-
-            var root = new JavaScriptSerializer().DeserializeObject(text) as Dictionary<string, object>;
-            var data = Get(root, "data");
-            var user = Get(data, "user");
+            var user = Query(Config.Channel, "stream{id createdAt}");
             if (user == null) throw new Exception("Twitch не вернул данные о канале");
             var stream = Get(user, "stream");
             if (stream == null) return null;
@@ -229,6 +215,39 @@ namespace StreamTracker
                                             DateTimeStyles.RoundtripKind);
             if (start.Kind == DateTimeKind.Utc) start = start.ToLocalTime();
             return new LiveInfo { Id = Convert.ToString(stream["id"]), Start = start };
+        }
+
+        // Есть ли такой канал: его отображаемое имя или null, если канала нет
+        public static string FindUser(string login)
+        {
+            var user = Query(login, "login displayName");
+            if (user == null) return null;
+            object name;
+            return user.TryGetValue("displayName", out name) && Convert.ToString(name) != "" ? Convert.ToString(name) : login;
+        }
+
+        // Запрос user(login) к публичному GQL Twitch; null — такого канала нет
+        static Dictionary<string, object> Query(string login, string fields)
+        {
+            if (!Regex.IsMatch(login ?? "", @"^[A-Za-z0-9_]{1,25}$")) throw new Exception("неверный ник канала");
+            var req = (HttpWebRequest)WebRequest.Create("https://gql.twitch.tv/gql");
+            req.Method = "POST";
+            req.ContentType = "application/json";
+            req.Timeout = 20000;
+            req.ReadWriteTimeout = 20000;
+            req.Headers.Add("Client-Id", "kimne78kx3ncx6brgo4mv6wki5h1ko");
+            byte[] body = Encoding.UTF8.GetBytes(
+                "{\"query\":\"query{user(login:\\\"" + login + "\\\"){" + fields + "}}\"}");
+            using (var s = req.GetRequestStream()) s.Write(body, 0, body.Length);
+
+            string text;
+            using (var resp = req.GetResponse())
+            using (var r = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                text = r.ReadToEnd();
+
+            var root = new JavaScriptSerializer().DeserializeObject(text) as Dictionary<string, object>;
+            if (root == null || !root.ContainsKey("data")) throw new Exception("Twitch не ответил");
+            return Get(Get(root, "data"), "user");
         }
 
         static Dictionary<string, object> Get(Dictionary<string, object> d, string key)
@@ -902,6 +921,9 @@ namespace StreamTracker
         public DateTime? LastCheck;
         public bool LastFailed;
         public bool IsLive;
+        // Когда начался идущий сейчас стрим (по записи в календаре). Стрим, начатый 21-го и идущий после полуночи,
+        // относится к 21-му — календарь подсвечивает «в эфире» именно этот день, а не «сегодня».
+        public DateTime? LiveStart;
         public bool Busy { get { return busy; } }
         public Settings Settings;
 
@@ -961,8 +983,10 @@ namespace StreamTracker
             {
                 checkTimer.Interval = Config.CheckMinutes * 60 * 1000;
                 CheckNow();
-                // Раз в день сверяем календарь со статистикой Twitch (если в браузере трекера выполнен вход)
-                if (Settings.lastSync != DateTime.Today.ToString("yyyy-MM-dd") && Directory.Exists(Chrome.ProfileDir) && !IsLive)
+                // Раз в день сверяем календарь со статистикой Twitch (если в браузере трекера выполнен вход;
+                // канал по ссылке — без входа, браузер не трогаем)
+                if (!Config.ByLink && Settings.lastSync != DateTime.Today.ToString("yyyy-MM-dd") &&
+                    Directory.Exists(Chrome.ProfileDir) && !IsLive)
                     SyncMonth(true);
             };
             checkTimer.Start();
@@ -1029,9 +1053,12 @@ namespace StreamTracker
                 if (ok)
                 {
                     IsLive = live != null;
+                    LiveStart = null;
                     if (live != null)
                     {
                         bool isNew = Logic.RegisterLive(Data, live.Id, live.Start, now);
+                        var rec = Data.streams.FirstOrDefault(s => s.id != "" && s.id.Split(',').Contains(live.Id));
+                        LiveStart = rec != null ? Store.Parse(rec.start) : live.Start;
                         Store.Save(Data);
                         if (isNew)
                             tray.ShowBalloonTip(10000, "Стрим засчитан",
@@ -1075,7 +1102,8 @@ namespace StreamTracker
                           (count < Config.Goal ? " (осталось " + (Config.Goal - count) + ")" : "") + ".\n\n" +
                           (count < Config.Goal && dl.Value.Day != Config.ReportDays[0]
                               ? "Если сегодня ещё будет стрим — собери отчёт после него."
-                              : "Трекер соберёт скриншоты статистики Twitch и список стримов в папку.");
+                              : Config.ByLink ? "Не забудь отправить отчёт о стримах."
+                                              : "Трекер соберёт скриншоты статистики Twitch и список стримов в папку.");
             reminder = DarkDialog.Notice("Сегодня отчёт до " + Config.Until, text, "Собрать отчёт", "Позже", Theme.Accent, ShowReport);
         }
 
@@ -1194,18 +1222,24 @@ namespace StreamTracker
         static bool IsAutostart() { return AppSetup.IsAutostart(); }
         static void SetAutostart(bool on) { AppSetup.SetAutostart(on); }
 
-        public void ShowSettings()
+        public void ShowSettings() { ShowSettings(null); }
+
+        public void ShowSettings(Form owner)
         {
             string oldChannel = Settings.channel;
+            if (owner == null) owner = form.Visible ? form : null;
             using (var f = new SetupForm(Settings, false))
-                if (f.ShowDialog(form) != DialogResult.OK) return;
+            {
+                if (owner == null) f.StartPosition = FormStartPosition.CenterScreen;
+                if (f.ShowDialog(owner) != DialogResult.OK) return;
+            }
             Config.Apply(Settings);
 
             // Сменили канал — стримы прежнего канала иначе считались бы для нового
             if (!string.Equals(oldChannel, Settings.channel, StringComparison.OrdinalIgnoreCase) && Data.streams.Count > 0 &&
-                DarkDialog.Ask(form, "Канал изменён",
+                DarkDialog.Ask(owner, "Канал изменён",
                     "В календаре остались стримы канала " + oldChannel + ". Очистить их, чтобы считались только стримы " +
-                    Settings.channel + "? Стримы нового канала трекер подтянет из статистики Twitch.",
+                    Settings.channel + "?" + (Config.ByLink ? "" : " Стримы нового канала трекер подтянет из статистики Twitch."),
                     "Очистить", "Оставить", Theme.Accent))
             {
                 Data.streams.Clear();
@@ -1219,7 +1253,7 @@ namespace StreamTracker
             CheckNow();
             // Сразу сверяемся со статистикой Twitch: могли только что войти или сменить канал
             Settings.lastSync = "";
-            if (Directory.Exists(Chrome.ProfileDir)) SyncMonth(true);
+            if (!Config.ByLink && Directory.Exists(Chrome.ProfileDir)) SyncMonth(true);
         }
 
         void ExitApp()
@@ -1315,7 +1349,8 @@ namespace StreamTracker
             Theme.StrCenter(g, "", Theme.Icon(14), IsHover("gear") ? Theme.Text : Theme.Muted, gear);
             Hits.Add(new Hit { Key = "gear", R = gear, Click = app.ShowSettings, Tip = "Настройки: канал, план, вход в Twitch" });
             Hits.Add(new Hit { Key = "pill", R = r, Click = app.CheckNow,
-                               Tip = "twitch.tv/" + Config.Channel + "\nЭфир проверяется каждые " + Config.CheckMinutes +
+                               Tip = "twitch.tv/" + Config.Channel + (Config.ByLink ? " (по ссылке)" : "") +
+                                     "\nЭфир проверяется каждые " + Config.CheckMinutes +
                                      " минут.\nКлик — проверить сейчас." });
         }
 
@@ -1423,7 +1458,7 @@ namespace StreamTracker
                 var onDay = month.Where(s => Store.Parse(s.start).Date == date).ToList();
                 bool today = date == now.Date, future = date > now.Date;
                 bool any = onDay.Count > 0, auto = onDay.Any(s => s.id != "");
-                bool liveNow = today && app.IsLive;
+                bool liveNow = app.IsLive && app.LiveStart.HasValue && app.LiveStart.Value.Date == date;
                 string key = "d" + day;
 
                 Color fill = Color.Transparent;
@@ -1467,7 +1502,7 @@ namespace StreamTracker
                     }
                     else tip.Append("\nСтрим добавлен вручную");
                 }
-                if (liveNow && !any) tip.Append("\nСейчас в эфире");
+                if (liveNow) tip.Append("\nСейчас в эфире");
                 if (dl.HasValue) tip.Append("\nОтчёт до " + Config.Until + (reportDone ? " — сдан" : ""));
                 Action click = null;
                 if (liveNow)

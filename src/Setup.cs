@@ -65,14 +65,17 @@ namespace StreamTracker
         }
     }
 
-    // Канал — это аккаунт, под которым выполнен вход в Twitch: статистику Twitch всё равно видит только владелец,
-    // поэтому отдельно вводить ссылку на канал не нужно и ошибиться с каналом нельзя.
+    // Канал задаётся двумя способами:
+    //  • «Войти в Twitch» — канал = аккаунт входа; так работают и отчёты со скриншотами (статистику видит только владелец);
+    //  • «По ссылке» — без входа: трекер только считает стримы и напоминает об отчётах.
     class SetupForm : PaintedForm
     {
-        const int W = 480, H = 552;
+        const int W = 480, H = 598;
+        const float FieldY = 172;
         readonly Settings settings;
         readonly bool first;
         readonly System.Windows.Forms.Timer loginPoll = new System.Windows.Forms.Timer { Interval = 3000 };
+        readonly System.Windows.Forms.Timer findTimer = new System.Windows.Forms.Timer { Interval = 700 };
 
         int goal;
         List<int> days;
@@ -81,6 +84,22 @@ namespace StreamTracker
         bool loginBusy, loginFailed, loginChecked;
         bool autostart, shortcut;
         DateTime pollUntil;
+
+        // Режим «По ссылке»
+        bool linkMode;
+        readonly TextBox box;
+        readonly Font boxFont;
+        float prefixY;
+        string linkLogin;               // найденный канал (null — ещё не найден)
+        string linkStatus = "";
+        int linkState;                  // 0 — пусто, 1 — ищу, 2 — найден, 3 — ошибка
+        int findSeq;
+        bool normalizing;
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, string l);
+        [DllImport("user32.dll")]
+        static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
 
         public SetupForm(Settings settings, bool first)
         {
@@ -101,6 +120,46 @@ namespace StreamTracker
             autostart = first || AppSetup.IsAutostart();
             shortcut = first || AppSetup.HasShortcut();
 
+            // Поле для ссылки — настоящее поле ввода (вставка, выделение, Ctrl+Z), нарисованное в стиле окна.
+            // Слева от него рисуется приставка «twitch.tv/», а вставленная ссылка целиком сокращается до ника.
+            boxFont = new Font(Theme.F(15).Name, (float)Math.Round(15 * K, 1), FontStyle.Regular, GraphicsUnit.Pixel);
+            box = new TextBox
+            {
+                BorderStyle = BorderStyle.None, BackColor = Theme.CardHi, ForeColor = Theme.Text, Font = boxFont,
+                MaxLength = 200, Visible = false
+            };
+            int prefixW = TextRenderer.MeasureText("twitch.tv/", boxFont, Size.Empty,
+                                                   TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix).Width;
+            var field = FieldRect();
+            int left = (int)Math.Round((field.X + 14) * K) + prefixW;
+            box.SetBounds(left, (int)Math.Round(FieldY * K + (44 * K - box.PreferredHeight) / 2),
+                          (int)Math.Round((field.Right - 10) * K) - left, box.PreferredHeight);
+            prefixY = box.Top / K;
+            Controls.Add(box);
+            box.HandleCreated += delegate
+            {
+                SendMessage(box.Handle, 0xD3, (IntPtr)3, IntPtr.Zero);              // без внутренних отступов — ник сразу за «twitch.tv/»
+                SendMessage(box.Handle, 0x1501, (IntPtr)1, "ник канала");           // подсказка в пустом поле
+            };
+            box.GotFocus += delegate { Invalidate(); };
+            box.LostFocus += delegate { Invalidate(); };
+            box.KeyDown += (s, e) =>
+            {
+                if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; FindChannel(); }
+            };
+
+            linkMode = !first && settings.byLink && settings.channel != "";
+            if (linkMode)
+            {
+                box.Text = settings.channel;
+                box.Visible = true;
+                linkLogin = settings.channel;
+                linkState = 2;
+                linkStatus = "✓ Отслеживается twitch.tv/" + settings.channel;
+            }
+            box.TextChanged += delegate { OnLinkTextChanged(); };
+            findTimer.Tick += delegate { FindChannel(); };
+
             loginPoll.Tick += delegate
             {
                 if (DateTime.Now > pollUntil) { loginPoll.Stop(); return; }
@@ -119,53 +178,223 @@ namespace StreamTracker
                 if (Chrome.LoginPageOpen()) return;
                 CheckLogin(true, false);
             };
-            Shown += delegate { CheckLogin(true); };
+            Shown += delegate
+            {
+                // В режиме ссылки браузер не нужен — вход проверяем, только когда переключатся на «Войти в Twitch»
+                if (linkMode) { box.Focus(); box.SelectionStart = box.Text.Length; }
+                else CheckLogin(true);
+            };
         }
 
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
             loginPoll.Stop();
+            findTimer.Stop();
+            findSeq++;   // ответ на запоздавший поиск канала больше не нужен
             base.OnFormClosed(e);
         }
 
-        // Канал для сохранения: аккаунт входа, а если вход сейчас не подтвердился (например, сессия истекла) —
-        // прежний канал из настроек, чтобы можно было поменять план, не входя заново
-        string Channel { get { return loginName ?? (first ? null : NullIfEmpty(settings.channel)); } }
+        protected override void Dispose(bool disposing)
+        {
+            base.Dispose(disposing);
+            if (disposing) { boxFont.Dispose(); loginPoll.Dispose(); findTimer.Dispose(); }
+        }
+
+        // Канал для сохранения. Со входом — аккаунт входа, а если вход сейчас не подтвердился (например, сессия
+        // истекла) — прежний канал из настроек, чтобы можно было поменять план, не входя заново.
+        // По ссылке — найденный канал.
+        string Channel
+        {
+            get
+            {
+                if (linkMode) return linkLogin;
+                return loginName ?? (first || settings.byLink ? null : NullIfEmpty(settings.channel));
+            }
+        }
         static string NullIfEmpty(string s) { return string.IsNullOrEmpty(s) ? null : s; }
+
+        RectangleF FieldRect() { return new RectangleF(24, FieldY, W - 48 - 120, 44); }
 
         protected override void Draw(Graphics g)
         {
             Theme.Str(g, first ? "ПЕРВЫЙ ЗАПУСК" : "НАСТРОЙКИ", Theme.Semi(12), Theme.Accent, 26, 20);
             Theme.Str(g, "Трекер стримов", Theme.Bold(25), Theme.Text, 24, 37);
 
-            // 1. Аккаунт Twitch
-            Theme.Str(g, "Аккаунт Twitch", Theme.Semi(15), Theme.Text, 24, 92);
-            Theme.StrWrap(g, "Трекер следит за каналом этого аккаунта. Вход хранится в отдельном профиле браузера " +
-                             "на этом компьютере — пароль трекер не видит.",
-                          Theme.F(12.5f), Theme.Muted, new RectangleF(24, 114, W - 48, 40));
-            DrawAccount(g, new RectangleF(24, 160, W - 48, 64));
-            Theme.Str(g, loginStatus, Theme.F(13), loginFailed ? Theme.Red : Theme.AccentLight, 26, 234);
+            // 1. Канал: со входом или по ссылке
+            Theme.Str(g, "Канал на Twitch", Theme.Semi(15), Theme.Text, 24, 92);
+            DrawSegment(g, new RectangleF(24, 120, W - 48, 40));
+            if (linkMode) DrawLink(g);
+            else
+            {
+                Theme.StrWrap(g, "Трекер следит за каналом этого аккаунта. Вход хранится в отдельном профиле браузера " +
+                                 "на этом компьютере — пароль трекер не видит.",
+                              Theme.F(12.5f), Theme.Muted, new RectangleF(24, FieldY, W - 48, 40));
+                DrawAccount(g, new RectangleF(24, 212, W - 48, 64));
+                Theme.Str(g, loginStatus, Theme.F(13), loginFailed ? Theme.Red : Theme.AccentLight, 26, 286);
+            }
 
             // 2. План
-            Theme.Str(g, "План", Theme.Semi(15), Theme.Text, 24, 270);
+            const float P = 316;
+            Theme.Str(g, "План", Theme.Semi(15), Theme.Text, 24, P);
             float sw = 136, sx = W - 24 - sw;
-            Row(g, 302, "Стримов в месяц");
-            Stepper(g, "goal", sx, 296, sw, goal + " " + Theme.Plural(goal, "стрим", "стрима", "стримов"),
+            Row(g, P + 32, "Стримов в месяц");
+            Stepper(g, "goal", sx, P + 26, sw, goal + " " + Theme.Plural(goal, "стрим", "стрима", "стримов"),
                     () => goal = Math.Max(1, goal - 1), () => goal = Math.Min(31, goal + 1));
-            Row(g, 346, "Дни отчётов");
-            Stepper(g, "day0", sx - 10 - sw, 340, sw, days[0] + "-го", () => ShiftDay(0, -1), () => ShiftDay(0, 1));
-            Stepper(g, "day1", sx, 340, sw, days[1] + "-го", () => ShiftDay(1, -1), () => ShiftDay(1, 1));
+            Row(g, P + 76, "Дни отчётов");
+            Stepper(g, "day0", sx - 10 - sw, P + 70, sw, days[0] + "-го", () => ShiftDay(0, -1), () => ShiftDay(0, 1));
+            Stepper(g, "day1", sx, P + 70, sw, days[1] + "-го", () => ShiftDay(1, -1), () => ShiftDay(1, 1));
 
             // 3. Удобства
-            Checkbox(g, "auto", 24, 398, "Запускать вместе с Windows", autostart, () => autostart = !autostart);
-            Checkbox(g, "lnk", 24, 432, "Ярлык на рабочем столе", shortcut, () => shortcut = !shortcut);
+            Checkbox(g, "auto", 24, P + 128, "Запускать вместе с Windows", autostart, () => autostart = !autostart);
+            Checkbox(g, "lnk", 24, P + 162, "Ярлык на рабочем столе", shortcut, () => shortcut = !shortcut);
 
             // Кнопки
             var ok = new RectangleF(W - 24 - 160, H - 64, 160, 40);
             if (Channel != null) DrawButton(g, "ok", ok, first ? "Готово" : "Сохранить", Theme.Accent, Color.White, Save);
-            else DrawButton(g, "ok", ok, first ? "Готово" : "Сохранить", Theme.CardHi, Theme.Faint, null, "Сначала войдите в Twitch");
+            else DrawButton(g, "ok", ok, first ? "Готово" : "Сохранить", Theme.CardHi, Theme.Faint, null,
+                            linkMode ? "Сначала укажите канал" : "Сначала войдите в Twitch");
             DrawButton(g, "cancel", new RectangleF(ok.X - 10 - 120, H - 64, 120, 40), first ? "Выйти" : "Отмена",
                        Theme.CardHi, Theme.Text, () => { DialogResult = DialogResult.Cancel; Close(); });
+        }
+
+        // Переключатель «Войти в Twitch / По ссылке»: выбранная половина светлее и с фиолетовой чертой снизу
+        void DrawSegment(Graphics g, RectangleF r)
+        {
+            Theme.FillRound(g, Theme.Card, r, 10);
+            float half = (r.Width - 6) / 2;
+            for (int i = 0; i < 2; i++)
+            {
+                bool link = i == 1, on = link == linkMode;
+                string key = link ? "segLink" : "segLogin";
+                var s = new RectangleF(r.X + 3 + i * half, r.Y + 3, half, r.Height - 6);
+                if (on)
+                {
+                    Theme.FillRound(g, Theme.CardHi, s, 8);
+                    Theme.FillRound(g, Theme.Accent, new RectangleF(s.X + s.Width / 2 - 20, s.Bottom - 3, 40, 3), 1.5f);
+                }
+                Theme.StrCenter(g, link ? "По ссылке" : "Войти в Twitch", Theme.Semi(13.5f),
+                                on || IsHover(key) ? Theme.Text : Theme.Muted, s);
+                Hits.Add(new Hit
+                {
+                    Key = key, R = s, Click = on ? (Action)null : () => SetMode(link),
+                    Tip = on ? null : link ? "Без входа: трекер считает стримы и напоминает об отчётах"
+                                           : "Со входом: ещё и отчёты со скриншотами статистики Twitch"
+                });
+            }
+        }
+
+        // Поле «twitch.tv/ник» с кнопкой «Найти», под ним — результат проверки
+        void DrawLink(Graphics g)
+        {
+            var field = FieldRect();
+            Theme.FillRound(g, Theme.CardHi, field, 10);
+            if (box.Focused) Theme.StrokeRound(g, Theme.Accent, 1.5f, field, 10);
+            else if (linkState == 3) Theme.StrokeRound(g, Theme.Alpha(Theme.Red, 160), 1.5f, field, 10);
+            Theme.Str(g, "twitch.tv/", Theme.F(15), Theme.Faint, field.X + 14, prefixY);
+            // Ник начинается ровно там, где кончается нарисованная приставка (меряем тем же способом, что и рисуем)
+            int left = (int)Math.Round((field.X + 14 + Theme.Width(g, "twitch.tv/", Theme.F(15))) * K);
+            if (box.Left != left)
+                box.SetBounds(left, box.Top, (int)Math.Round((field.Right - 10) * K) - left, box.Height);
+            Hits.Add(new Hit { Key = "field", R = field, Click = () => { box.Focus(); box.SelectionStart = box.Text.Length; } });
+
+            var find = new RectangleF(W - 24 - 110, FieldY, 110, 44);
+            if (linkState == 1) DrawButton(g, "find", find, "Ищу…", Theme.CardHi, Theme.Muted, null);
+            else if (linkState == 2) DrawButton(g, "find", find, "Найти", Theme.CardHi, Theme.Text, FindChannel, "Проверить канал ещё раз");
+            else DrawButton(g, "find", find, "Найти", Theme.Accent, Color.White, FindChannel,
+                            "Проверить, что такой канал есть на Twitch\n(можно вставить ссылку целиком)");
+
+            Color c = linkState == 2 ? Theme.Green : linkState == 3 ? Theme.Red : Theme.AccentLight;
+            Theme.Str(g, linkStatus, Theme.F(13), c, 26, FieldY + 54);
+            Theme.StrWrap(g, "Трекер будет следить за эфиром канала и напоминать об отчётах. " +
+                             "Скриншоты статистики — только со входом.",
+                          Theme.F(12.5f), Theme.Muted, new RectangleF(24, FieldY + 80, W - 48, 40));
+        }
+
+        void SetMode(bool link)
+        {
+            linkMode = link;
+            box.Visible = link;
+            if (link)
+            {
+                // Подставляем уже известный канал, чтобы не вводить его заново
+                if (box.Text.Trim() == "")
+                {
+                    string known = loginName ?? NullIfEmpty(settings.channel);
+                    if (known != null) box.Text = known;
+                }
+                box.Focus();
+                box.SelectionStart = box.Text.Length;
+            }
+            else
+            {
+                ActiveControl = null;
+                if (!loginChecked && !loginBusy) CheckLogin(true);
+            }
+            Invalidate();
+        }
+
+        // Ник из ссылки вида twitch.tv/ник (с https://, www., m., /popout/, @ и хвостом после ника) или просто ника
+        public static string ParseLogin(string text)
+        {
+            text = (text ?? "").Trim();
+            var m = Regex.Match(text, @"twitch\.tv/(?:popout/)?@?([A-Za-z0-9_]{2,25})(?![A-Za-z0-9_])", RegexOptions.IgnoreCase);
+            if (!m.Success) m = Regex.Match(text, @"^@?([A-Za-z0-9_]{2,25})$");
+            return m.Success ? m.Groups[1].Value.ToLowerInvariant() : null;
+        }
+
+        void OnLinkTextChanged()
+        {
+            if (normalizing) return;
+            // Вставили ссылку целиком — оставляем в поле только ник (приставка twitch.tv/ уже нарисована)
+            string t = box.Text;
+            if (t.IndexOf("twitch.tv", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                string login = ParseLogin(t);
+                if (login != null && login != t)
+                {
+                    normalizing = true;
+                    box.Text = login;
+                    box.SelectionStart = login.Length;
+                    normalizing = false;
+                }
+            }
+            // Канал проверяется сам, когда перестали печатать
+            findSeq++;
+            linkLogin = null;
+            linkState = 0;
+            linkStatus = "";
+            findTimer.Stop();
+            if (box.Text.Trim() != "") findTimer.Start();
+            Invalidate();
+        }
+
+        async void FindChannel()
+        {
+            findTimer.Stop();
+            int seq = ++findSeq;
+            linkLogin = null;
+            string text = box.Text.Trim();
+            string login = ParseLogin(text);
+            if (text == "") { linkState = 0; linkStatus = ""; }
+            else if (login == null) { linkState = 3; linkStatus = "Это не похоже на ссылку на канал Twitch"; }
+            else { linkState = 1; linkStatus = "Ищу канал…"; }
+            Invalidate();
+            if (linkState != 1) return;
+
+            string display = null, error = null;
+            try { display = await Task.Run(() => Twitch.FindUser(login)); }
+            catch (Exception ex) { error = ex.Message; }
+            if (seq != findSeq || IsDisposed) return;   // пока искали, текст поменяли или окно закрыли
+
+            if (error != null) { linkState = 3; linkStatus = "Не получилось проверить канал: " + error; }
+            else if (display == null) { linkState = 3; linkStatus = "Канала twitch.tv/" + login + " нет на Twitch"; }
+            else
+            {
+                linkState = 2;
+                linkLogin = login;
+                linkStatus = "✓ " + display + " — канал найден";
+            }
+            Invalidate();
         }
 
         // Карточка аккаунта: кружок с буквой, ник и кнопка «Войти» / «Сменить»
@@ -197,7 +426,7 @@ namespace StreamTracker
                 return;
             }
             Theme.Str(g, "Вход не выполнен", Theme.Semi(15), Theme.Text, tx, card.Y + 12);
-            string sub = !first && settings.channel != "" ? "сейчас отслеживается " + settings.channel : "нужен, чтобы трекер знал ваш канал";
+            string sub = !first && settings.channel != "" ? "сейчас: " + settings.channel : "для учёта стримов и отчётов";
             Theme.Str(g, sub, Theme.F(12.5f), Theme.Muted, tx, card.Y + 35);
             DrawButton(g, "login", btn, "Войти в Twitch", Theme.Accent, Color.White, OpenLogin,
                        "Откроется окно браузера со страницей входа Twitch");
@@ -333,6 +562,7 @@ namespace StreamTracker
             string channel = Channel;
             if (channel == null) return;
             settings.channel = channel;
+            settings.byLink = linkMode;
             settings.goal = goal;
             settings.reportDays = days.ToList();
             settings.Save();

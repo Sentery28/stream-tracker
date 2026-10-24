@@ -123,6 +123,7 @@ namespace StreamTracker
     public class Settings
     {
         public string channel { get; set; }        // ник на Twitch (login)
+        public bool byLink { get; set; }           // канал указан ссылкой, без входа: только учёт стримов и напоминания
         public int goal { get; set; }              // стримов в месяц
         public List<int> reportDays { get; set; }  // дни сдачи отчётов
         public string lastSync { get; set; }       // когда последний раз подтягивали стримы со статистики Twitch (yyyy-MM-dd)

@@ -234,9 +234,10 @@ namespace StreamTracker
             {
                 Theme.StrCenter(g, Theme.GlyphCalendar, Theme.Icon(34), Theme.Faint,
                                 new RectangleF(card.X, card.Y + card.Height / 2 - 70, card.Width, 40));
-                Theme.StrCenter(g, "Нажмите «Собрать»", Theme.Semi(16), Theme.Text,
-                                new RectangleF(card.X, card.Y + card.Height / 2 - 18, card.Width, 24));
-                Theme.StrCenter(g, "Трекер откроет статистику Twitch и сделает скриншот каждого стрима за период",
+                Theme.StrCenter(g, Config.ByLink ? "Для отчёта нужен вход в Twitch" : "Нажмите «Собрать»", Theme.Semi(16),
+                                Theme.Text, new RectangleF(card.X, card.Y + card.Height / 2 - 18, card.Width, 24));
+                Theme.StrCenter(g, Config.ByLink ? "Канал указан ссылкой — статистику Twitch показывает только владельцу канала"
+                                                 : "Трекер откроет статистику Twitch и сделает скриншот каждого стрима за период",
                                 Theme.F(13), Theme.Muted, new RectangleF(card.X, card.Y + card.Height / 2 + 12, card.Width, 20));
             }
             else DrawResult(g, card);
@@ -425,6 +426,19 @@ namespace StreamTracker
         async void Collect()
         {
             if (working) return;
+            if (Config.ByLink)
+            {
+                // Без входа статистику не открыть — предлагаем переключиться на вход в настройках
+                if (DarkDialog.Ask(this, "Нужен вход в Twitch",
+                        "Канал " + Config.Channel + " указан ссылкой, без входа. Скриншоты статистики Twitch показывает " +
+                        "только владельцу канала — в настройках выберите «Войти в Twitch», и отчёт можно будет собрать.",
+                        "Открыть настройки", "Отмена", Theme.Accent))
+                {
+                    app.ShowSettings(this);
+                    if (!IsDisposed) Invalidate();
+                }
+                return;
+            }
             bool needLogin = false;
             working = true;
             failed = false;
