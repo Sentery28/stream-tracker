@@ -179,14 +179,21 @@ namespace StreamTracker
             return sb.ToString();
         }
 
-        // Период по умолчанию: со дня после прошлого срока по день текущего срока включительно (14–29, 30–13)
-        public static void DefaultPeriod(DateTime now, out DateTime from, out DateTime to)
+        // Период по умолчанию — см. Logic.ReportPeriod (зависит от того, какие отчёты отмечены сданными)
+        public static void DefaultPeriod(DateTime now, TrackerData data, out DateTime from, out DateTime to)
         {
-            DateTime d = Logic.CurrentDeadline(now);
-            var first = new DateTime(d.Year, d.Month, 1);
-            DateTime prev = Logic.Deadlines(first.AddMonths(-1)).Concat(Logic.Deadlines(first)).Where(x => x.Date < d.Date).Max();
-            from = prev.Date.AddDays(1);
-            to = d.Date;
+            Logic.ReportPeriod(now, data, out from, out to);
+        }
+
+        // С какого дня сверять календарь со статистикой Twitch: с начала месяца, а в начале месяца — ещё и хвост
+        // прошлого (стримы после последнего отчёта прошлого месяца), чтобы они не потерялись при смене месяца
+        public static DateTime SyncFrom(DateTime now)
+        {
+            var first = new DateTime(now.Year, now.Month, 1);
+            DateTime prevDeadline = Logic.Deadlines(first.AddMonths(-1)).Concat(Logic.Deadlines(first))
+                                         .Where(x => x.Date < now.Date).Max();
+            DateTime tail = prevDeadline.Date.AddDays(1);
+            return tail < first ? tail : first;
         }
     }
 
@@ -211,7 +218,7 @@ namespace StreamTracker
             StartPosition = FormStartPosition.CenterScreen;
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
             SetSize(W, H);
-            Dashboard.DefaultPeriod(DateTime.Now, out from, out to);
+            Dashboard.DefaultPeriod(DateTime.Now, app.Data, out from, out to);
         }
 
         protected override void OnFormClosed(FormClosedEventArgs e)
@@ -223,6 +230,7 @@ namespace StreamTracker
 
         string PeriodTitle()
         {
+            if (from.Date == to.Date) return to.ToString("d MMMM", Config.Ru);
             return from.Month == to.Month && from.Year == to.Year
                 ? from.Day + " – " + to.ToString("d MMMM", Config.Ru)
                 : from.ToString("d MMMM", Config.Ru) + " – " + to.ToString("d MMMM", Config.Ru);
@@ -490,6 +498,7 @@ namespace StreamTracker
                     outDir = null;
                 }
                 items = list;
+                app.Data.lastCollected = Logic.Key(from) + "|" + Logic.Key(to);   // Import ниже сохранит данные
                 int added = app.Import(list);
                 status = list.Count == 0 ? "Стримов за период не найдено"
                        : "Готово: " + list.Count + " " + Theme.Plural(list.Count, "стрим", "стрима", "стримов") +

@@ -22,7 +22,7 @@ using Microsoft.Win32;
 
 [assembly: System.Reflection.AssemblyTitle("Трекер стримов")]
 [assembly: System.Reflection.AssemblyProduct("Трекер стримов")]
-[assembly: System.Reflection.AssemblyVersion("1.2.1.0")]
+[assembly: System.Reflection.AssemblyVersion("1.2.2.0")]
 
 namespace StreamTracker
 {
@@ -64,7 +64,18 @@ namespace StreamTracker
         public List<StreamRec> streams { get; set; }
         public List<string> reports { get; set; }   // даты сданных отчётов (yyyy-MM-dd)
         public string lastReminder { get; set; }
-        public TrackerData() { streams = new List<StreamRec>(); reports = new List<string>(); lastReminder = ""; }
+        // Срок отчёта → по какой день включительно стримы вошли в сданный отчёт (если сдали позже срока,
+        // следующий период начинается со дня после него — без дублей и пропусков)
+        public Dictionary<string, string> coveredTo { get; set; }
+        public Dictionary<string, string> markedOn { get; set; }   // срок отчёта → в какой день его отметили сданным
+        public string lastCollected { get; set; }   // последний собранный период «yyyy-MM-dd|yyyy-MM-dd»
+        public List<string> removed { get; set; }   // начала стримов с Twitch, убранных вручную, — сверка их не возвращает
+        public TrackerData()
+        {
+            streams = new List<StreamRec>(); reports = new List<string>(); lastReminder = "";
+            coveredTo = new Dictionary<string, string>(); markedOn = new Dictionary<string, string>(); lastCollected = "";
+            removed = new List<string>();
+        }
     }
 
     static class Store
@@ -103,6 +114,11 @@ namespace StreamTracker
             }
             if (d.reports == null) d.reports = new List<string>();
             if (d.lastReminder == null) d.lastReminder = "";
+            if (d.coveredTo == null) d.coveredTo = new Dictionary<string, string>();
+            if (d.markedOn == null) d.markedOn = new Dictionary<string, string>();
+            if (d.lastCollected == null) d.lastCollected = "";
+            d.removed = (d.removed ?? new List<string>()).Where(r => r != null &&
+                DateTime.TryParseExact(r, Config.Fmt, CultureInfo.InvariantCulture, DateTimeStyles.None, out tmp)).ToList();
             return d;
         }
 
@@ -110,6 +126,11 @@ namespace StreamTracker
         {
             d.streams = d.streams.OrderBy(s => s.start, StringComparer.Ordinal).ToList();
             d.reports = d.reports.Distinct().OrderBy(r => r, StringComparer.Ordinal).ToList();
+            foreach (var k in d.coveredTo.Keys.Where(k => !d.reports.Contains(k)).ToList()) d.coveredTo.Remove(k);
+            foreach (var k in d.markedOn.Keys.Where(k => !d.reports.Contains(k)).ToList()) d.markedOn.Remove(k);
+            // Сверка смотрит не дальше прошлого месяца — старые отметки об убранных стримах не нужны
+            string oldest = Format(DateTime.Now.AddDays(-100));
+            d.removed = d.removed.Distinct().Where(r => string.CompareOrdinal(r, oldest) >= 0).ToList();
             Directory.CreateDirectory(Paths.Data);
             string tmp = DataPath + ".tmp";
             File.WriteAllText(tmp, new JavaScriptSerializer().Serialize(d), new UTF8Encoding(false));
@@ -153,6 +174,87 @@ namespace StreamTracker
         }
 
         public static string Key(DateTime deadline) { return deadline.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture); }
+
+        static DateTime? ParseDay(string s)
+        {
+            DateTime t;
+            return DateTime.TryParseExact(s ?? "", "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out t)
+                ? t : (DateTime?)null;
+        }
+
+        // Отчёт, который показывается в главном окне: сегодняшний; прошлый в этом месяце, если он не отмечен
+        // (отметить можно и после срока) или отмечен только сегодня (чтобы можно было снять отметку); иначе — ближайший
+        public static DateTime CardDeadline(DateTime now, TrackerData d)
+        {
+            var t = TodayDeadline(now);
+            if (t.HasValue) return t.Value;
+            var past = Deadlines(now).Where(x => x.Date < now.Date).OrderBy(x => x).ToList();
+            if (past.Count > 0)
+            {
+                var p = past.Last();
+                if (!d.reports.Contains(Key(p))) return p;
+                string marked;
+                if (d.markedOn.TryGetValue(Key(p), out marked) && marked == Key(now)) return p;
+            }
+            return NextDeadline(now);
+        }
+
+        // Период отчёта по умолчанию. Периоды не выходят за границы месяца (при отчётах 13-го и 29-го: 1–13, 14–29).
+        //  • Пока прошлый отчёт месяца не отмечен сданным, его период продолжается по сегодня: 14-го — «1–14».
+        //  • После отметки следующий период начинается со дня после последнего дня, вошедшего в сданный отчёт.
+        //  • После последнего отчёта месяца, пока месяц не кончился, последний период продолжается по сегодня.
+        //  • В новом месяце — с 1-го числа по ближайший отчёт.
+        public static void ReportPeriod(DateTime now, TrackerData d, out DateTime from, out DateTime to)
+        {
+            DateTime today = now.Date;
+            var first = new DateTime(today.Year, today.Month, 1);
+            var days = Deadlines(first).Select(x => x.Date).Distinct().OrderBy(x => x).ToList();
+
+            int ti = days.IndexOf(today);
+            int next = days.FindIndex(x => x > today);
+            if (ti >= 0) { from = PeriodStart(days, ti, d, first); to = today; }                 // день отчёта
+            else if (next == 0) { from = first; to = days[0]; }                                   // до первого отчёта месяца
+            else if (next < 0) { from = PeriodStart(days, days.Count - 1, d, first); to = today; }   // после последнего
+            else
+            {
+                DateTime p = days[next - 1];
+                if (d.reports.Contains(Key(p))) { from = AfterReport(p, d); to = days[next]; }
+                else { from = PeriodStart(days, next - 1, d, first); to = today; }               // прошлый не отмечен
+            }
+            if (from > to) from = to;
+        }
+
+        // Начало периода, который заканчивается сроком days[i]. Неотмеченный более ранний отчёт период
+        // не растягивает: он мог быть сдан ещё до установки трекера, и период тянулся бы с 1-го числа.
+        static DateTime PeriodStart(List<DateTime> days, int i, TrackerData d, DateTime first)
+        {
+            if (i == 0) return first;
+            DateTime p = days[i - 1];
+            return d.reports.Contains(Key(p)) ? AfterReport(p, d) : p.AddDays(1);
+        }
+
+        // Первый день после сданного отчёта: после последнего вошедшего в него дня (не раньше дня после срока)
+        static DateTime AfterReport(DateTime deadline, TrackerData d)
+        {
+            string s;
+            DateTime? covered = d.coveredTo.TryGetValue(Key(deadline), out s) ? ParseDay(s) : null;
+            DateTime last = covered.HasValue && covered.Value > deadline.Date ? covered.Value : deadline.Date;
+            return last.AddDays(1);
+        }
+
+        // По какой день включительно стримы вошли в отчёт, который отмечают сданным сегодня
+        public static DateTime CoveredTo(DateTime deadline, DateTime now, TrackerData d)
+        {
+            // Если отчёт собирали в трекере и в собранный период входит срок — берём конец этого периода
+            // (но не позже сегодняшнего дня: будущих стримов в отчёте быть не может)
+            var parts = (d.lastCollected ?? "").Split('|');
+            DateTime? f = parts.Length == 2 ? ParseDay(parts[0]) : null, t = parts.Length == 2 ? ParseDay(parts[1]) : null;
+            if (f.HasValue && t.HasValue && f.Value <= deadline.Date && deadline.Date <= t.Value)
+                return t.Value > now.Date ? now.Date : t.Value;
+            // Отчёт собирали не в трекере — считаем, что он покрыл дни по срок. Если на деле в него вошли
+            // и более поздние дни, следующий отчёт их повторит; это лучше, чем потерять стримы.
+            return deadline.Date;
+        }
 
         public static List<StreamRec> MonthStreams(TrackerData d, DateTime now)
         {
@@ -201,13 +303,19 @@ namespace StreamTracker
         public DateTime Start;
     }
 
+    // Twitch не знает такого канала: ник сменили, канал удалён или заблокирован
+    class ChannelNotFoundException : Exception
+    {
+        public ChannelNotFoundException() : base("Twitch не находит канал") { }
+    }
+
     static class Twitch
     {
         // Тот же публичный запрос, что делает сам сайт Twitch. null — канал офлайн.
         public static LiveInfo GetLive()
         {
             var user = Query(Config.Channel, "stream{id createdAt}");
-            if (user == null) throw new Exception("Twitch не вернул данные о канале");
+            if (user == null) throw new ChannelNotFoundException();
             var stream = Get(user, "stream");
             if (stream == null) return null;
 
@@ -920,6 +1028,7 @@ namespace StreamTracker
         public TrackerData Data;
         public DateTime? LastCheck;
         public bool LastFailed;
+        public bool ChannelMissing;   // Twitch не находит канал (например, сменили ник) — это не «нет связи»
         public bool IsLive;
         // Когда начался идущий сейчас стрим (по записи в календаре). Стрим, начатый 21-го и идущий после полуночи,
         // относится к 21-му — календарь подсвечивает «в эфире» именно этот день, а не «сегодня».
@@ -1043,13 +1152,15 @@ namespace StreamTracker
             try
             {
                 LiveInfo live = null;
-                bool ok = true;
+                bool ok = true, missing = false;
                 try { live = await Task.Run(() => Twitch.GetLive()); }
+                catch (ChannelNotFoundException) { ok = false; missing = true; }
                 catch { ok = false; }
 
                 DateTime now = DateTime.Now;
                 LastCheck = now;
                 LastFailed = !ok;
+                ChannelMissing = missing;
                 if (ok)
                 {
                     IsLive = live != null;
@@ -1138,6 +1249,9 @@ namespace StreamTracker
             int added = 0;
             foreach (var s in list)
             {
+                // Этот стрим убрали из календаря вручную — не возвращаем его (окно узкое, чтобы не задеть
+                // настоящий стрим, начатый вскоре после убранного тестового)
+                if (Data.removed.Any(r => Math.Abs((Store.Parse(r) - s.Start).TotalMinutes) <= 15)) continue;
                 string start = Store.Format(s.Start), end = Store.Format(s.Start + s.Length);
                 var near = Data.streams.FirstOrDefault(x => Math.Abs((Store.Parse(x.start) - s.Start).TotalMinutes) <= 90) ??
                            Data.streams.FirstOrDefault(x => x.id == "" && Store.Parse(x.start).Date == s.Start.Date);
@@ -1163,10 +1277,7 @@ namespace StreamTracker
             syncing = true;
             try
             {
-                DateTime from, to;
-                Dashboard.DefaultPeriod(DateTime.Now, out from, out to);
-                var monthStart = new DateTime(DateTime.Today.Year, DateTime.Today.Month, 1);
-                if (monthStart < from) from = monthStart;
+                DateTime from = Dashboard.SyncFrom(DateTime.Now);
                 var list = await Task.Run(() => Dashboard.Collect(from, DateTime.Today, null, null));
                 int added = Import(list);
                 Settings.lastSync = DateTime.Today.ToString("yyyy-MM-dd");
@@ -1196,14 +1307,22 @@ namespace StreamTracker
 
         public void RemoveStreams(IEnumerable<StreamRec> items)
         {
-            foreach (var s in items.ToList()) Data.streams.Remove(s);
+            foreach (var s in items.ToList())
+            {
+                Data.streams.Remove(s);
+                if (s.id != "") Data.removed.Add(s.start);   // иначе ежедневная сверка с Twitch вернёт его обратно
+            }
             Store.Save(Data);
             UpdateUi();
         }
 
         public void MarkReport(DateTime deadline)
         {
-            Data.reports.Add(Logic.Key(deadline));
+            DateTime now = DateTime.Now;
+            string key = Logic.Key(deadline);
+            Data.reports.Add(key);
+            Data.markedOn[key] = Logic.Key(now);
+            Data.coveredTo[key] = Logic.Key(Logic.CoveredTo(deadline, now, Data));
             Store.Save(Data);
             UpdateUi();
             if (reminder != null && !reminder.IsDisposed) reminder.Close();   // напоминание больше не нужно
@@ -1244,7 +1363,9 @@ namespace StreamTracker
             {
                 Data.streams.Clear();
                 Data.reports.Clear();
+                Data.removed.Clear();
                 Data.lastReminder = "";
+                Data.lastCollected = "";
                 Store.Save(Data);
             }
 
@@ -1327,6 +1448,7 @@ namespace StreamTracker
             bool dot = false;
             if (app.Busy) { label = "проверяю…"; bg = Theme.Card; fg = Theme.Muted; }
             else if (app.IsLive) { label = "В ЭФИРЕ"; bg = Theme.Red; fg = Color.White; dot = true; }
+            else if (app.ChannelMissing) { label = "канал не найден"; bg = Theme.Alpha(Theme.Orange, 40); fg = Theme.Orange; }
             else if (app.LastFailed) { label = "нет связи"; bg = Theme.Alpha(Theme.Orange, 40); fg = Theme.Orange; }
             else if (app.LastCheck.HasValue) { label = "офлайн · " + app.LastCheck.Value.ToString("HH:mm"); bg = Theme.Card; fg = Theme.Muted; }
             else { label = "офлайн"; bg = Theme.Card; fg = Theme.Muted; }
@@ -1349,7 +1471,9 @@ namespace StreamTracker
             Theme.StrCenter(g, "", Theme.Icon(14), IsHover("gear") ? Theme.Text : Theme.Muted, gear);
             Hits.Add(new Hit { Key = "gear", R = gear, Click = app.ShowSettings, Tip = "Настройки: канал, план, вход в Twitch" });
             Hits.Add(new Hit { Key = "pill", R = r, Click = app.CheckNow,
-                               Tip = "twitch.tv/" + Config.Channel + (Config.ByLink ? " (по ссылке)" : "") +
+                               Tip = app.ChannelMissing
+                                   ? "Twitch не находит канал " + Config.Channel + ".\nЕсли ник изменился — укажите канал заново\nв настройках (шестерёнка слева)."
+                                   : "twitch.tv/" + Config.Channel + (Config.ByLink ? " (по ссылке)" : "") +
                                      "\nЭфир проверяется каждые " + Config.CheckMinutes +
                                      " минут.\nКлик — проверить сейчас." });
         }
@@ -1396,25 +1520,27 @@ namespace StreamTracker
             var card = new RectangleF(20, 274, 400, 132);
             Theme.FillRound(g, Theme.Card, card, 16);
 
-            DateTime next = Logic.CurrentDeadline(now);
+            // Прошлый отчёт месяца, если он не отмечен, — остаётся здесь, чтобы его можно было отметить и после срока
+            DateTime next = Logic.CardDeadline(now, app.Data);
             bool done = app.Data.reports.Contains(Logic.Key(next));
             int days = (next.Date - now.Date).Days;
             bool overdue = !done && now > next;
+            bool past = next.Date < now.Date;
 
-            Color tone = done ? Theme.Green : days == 0 ? Theme.Red : days == 1 ? Theme.Orange : Theme.Accent;
+            Color tone = done ? Theme.Green : overdue ? Theme.Orange : days == 0 ? Theme.Red : days == 1 ? Theme.Orange : Theme.Accent;
             var tile = new RectangleF(card.X + 16, card.Y + 18, 48, 48);
             Theme.FillRound(g, Theme.Alpha(tone, 45), tile, 12);
             Theme.StrCenter(g, done ? Theme.GlyphCheck : Theme.GlyphCalendar, Theme.Icon(21), tone, tile);
 
             float tx = card.X + 78;
-            Theme.Str(g, "Ближайший отчёт", Theme.F(12.5f), Theme.Muted, tx, card.Y + 15);
+            Theme.Str(g, past ? "Прошлый отчёт" : "Ближайший отчёт", Theme.F(12.5f), Theme.Muted, tx, card.Y + 15);
             Theme.Str(g, next.ToString("d MMMM", Config.Ru) + ", до " + Config.Until, Theme.Semi(17), Theme.Text, tx, card.Y + 32);
             string when = done ? "отмечен как сданный"
-                        : overdue ? "срок прошёл — отметьте, если сдали"
+                        : overdue ? "не отмечен — отметьте, когда сдадите"
                         : days == 0 ? "сегодня!"
                         : days == 1 ? "завтра"
                         : "через " + days + " " + Theme.Plural(days, "день", "дня", "дней");
-            Theme.Str(g, when, Theme.Semi(12.5f), done ? Theme.Green : days <= 1 ? tone : Theme.Muted, tx, card.Y + 56);
+            Theme.Str(g, when, Theme.Semi(12.5f), done ? Theme.Green : overdue || days <= 1 ? tone : Theme.Muted, tx, card.Y + 56);
 
             float bw = (card.Width - 32 - 10) / 2;
             DrawButton(g, "collect", new RectangleF(card.X + 16, card.Y + 82, bw, 36), "Собрать отчёт", Theme.Accent, Color.White,
