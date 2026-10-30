@@ -129,8 +129,22 @@ namespace StreamTracker
             finally { Chrome.Lock.Release(); }
         }
 
+        // Всплывающие окна Twitch («Итоги трансляций уже доступны!» и т. п.) с затемнением страницы
+        // перекрывают статистику на скриншоте. Скрываем их стилем: ничего не нажимаем и не меняем в аккаунте.
+        const string HidePopupsJs = @"(() => {
+  if (!document.getElementById('stream-tracker-hide')) {
+    const s = document.createElement('style');
+    s.id = 'stream-tracker-hide';
+    s.textContent = '.ReactModalPortal, .ReactModal__Overlay { display: none !important; }';
+    document.head.appendChild(s);
+  }
+  return true;
+})()";
+
         static async Task Capture(Cdp p, string path)
         {
+            await p.Eval(HidePopupsJs);
+            await Task.Delay(150);   // дать странице перерисоваться без окна
             var c = await p.Eval(ClipJs) as Dictionary<string, object>;
             var shot = await p.Send("Page.captureScreenshot", new Dictionary<string, object>
             {
